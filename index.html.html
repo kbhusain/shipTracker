@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bahri Fleet AIS Tracker (OpenStreetMap)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; height: 100vh; background: #0f172a; color: #f8fafc; }
+    #sidebar { width: 340px; background: #1e293b; border-right: 1px solid #334155; display: flex; flex-direction: column; }
+    .header { padding: 16px; border-bottom: 1px solid #334155; }
+    .header h1 { font-size: 1.1rem; margin-bottom: 6px; }
+    .status-bar { font-size: 0.8rem; color: #94a3b8; display: flex; justify-content: space-between; margin-bottom: 10px; }
+    .controls { display: flex; gap: 8px; align-items: center; }
+    button { background: #2563eb; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.85rem; }
+    button:hover { background: #1d4ed8; }
+    label.toggle { font-size: 0.8rem; color: #cbd5e1; display: flex; align-items: center; gap: 5px; cursor: pointer; }
+    #search { width: 100%; padding: 8px 12px; background: #0f172a; border: 1px solid #334155; color: #f8fafc; border-radius: 6px; margin-top: 10px; }
+    #vessel-list { flex: 1; overflow-y: auto; padding: 8px; }
+    .vessel-item { padding: 10px; border-radius: 6px; margin-bottom: 6px; background: #0f172a; border: 1px solid #334155; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+    .vessel-item:hover { border-color: #38bdf8; }
+    .vessel-name { font-weight: 600; font-size: 0.9rem; }
+    .vessel-meta { font-size: 0.75rem; color: #94a3b8; margin-top: 2px; }
+    .badge { font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+    .badge-live { background: #065f46; color: #6ee7b7; }
+    .badge-wait { background: #334155; color: #94a3b8; }
+    #map { flex: 1; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <div class="header">
+      <h1>Bahri Fleet AIS Tracker</h1>
+      <div class="status-bar">
+        <span id="stats">Loading fleet...</span>
+        <span id="countdown">Next: 60:00</span>
+      </div>
+      <div class="controls">
+        <button id="refresh-btn">Refresh Now</button>
+        <label class="toggle">
+          <input type="checkbox" id="auto-refresh" checked />
+          Auto-refresh (1h)
+        </label>
+      </div>
+      <input type="text" id="search" placeholder="Filter by vessel name or IMO..." />
+    </div>
+    <div id="vessel-list"></div>
+  </div>
+  <div id="map"></div>
+
+  <script>
+    // Initialize OpenStreetMap via Leaflet
+    const map = L.map('map').setView([24.0, 45.0], 3);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const markers = new Map();
+    let fleetData = [];
+    let secondsRemaining = 3600;
+
+    function createShipIcon(heading) {
+      const deg = heading ?? 0;
+      return L.divIcon({
+        className: '',
+        html: `<svg width="22" height="22" viewBox="0 0 24 24" style="transform: rotate(${deg}deg);">
+                 <path d="M12 2L19 21L12 17L5 21L12 2Z" fill="#10b981" stroke="#064e3b" stroke-width="1.5"/>
+               </svg>`,
+        iconSize: [22, 22],
+        iconAnchor: [11, 11]
+      });
+    }
+
+    async function fetchFleet() {
+      const res = await fetch('/api/fleet');
+      const data = await res.json();
+      fleetData = data.vessels;
+
+      document.getElementById('stats').textContent =
+        `Plotted: ${data.located_count}/${data.total_vessels} | Stream: ${data.stream_status}`;
+
+      updateMarkers();
+      renderList();
+      secondsRemaining = 3600;
+    }
+
+    function updateMarkers() {
+      fleetData.forEach(v => {
+        if (v.lat !== null && v.lon !== null) {
+          const popupHtml = `
+            <strong>${v.name}</strong> (IMO: ${v.imo})<br/>
+            MMSI: ${v.mmsi || 'Pending'}<br/>
+            Speed: ${v.sog !== null ? v.sog + ' kn' : 'N/A'} | Course: ${v.cog !== null ? v.cog + '°' : 'N/A'}<br/>
+            Destination: ${v.destination || 'Unknown'}<br/>
+            Last AIS: ${v.last_seen ? new Date(v.last_seen).toLocaleString() : 'N/A'}
+          `;
+
+          if (markers.has(v.imo)) {
+            const m = markers.get(v.imo);
+            m.setLatLng([v.lat, v.lon]);
+            m.setIcon(createShipIcon(v.heading ?? v.cog));
+            m.setPopupContent(popupHtml);
+          } else {
+            const m = L.marker([v.lat, v.lon], { icon: createShipIcon(v.heading ?? v.cog) })
+              .bindPopup(popupHtml)
+              .addTo(map);
+            markers.set(v.imo, m);
+          }
+        }
+      });
+    }
+
+    function renderList() {
+      const q = document.getElementById('search').value.toLowerCase();
+      const container = document.getElementById('vessel-list');
+      container.innerHTML = '';
+
+      fleetData
+        .filter(v => v.name.toLowerCase().includes(q) || String(v.imo).includes(q))
+        .forEach(v => {
+          const located = v.lat !== null && v.lon !== null;
+          const div = document.createElement('div');
+          div.className = 'vessel-item';
+          div.innerHTML = `
+            <div>
+              <div class="vessel-name">${v.name}</div>
+              <div class="vessel-meta">IMO: ${v.imo} ${v.mmsi ? '• MMSI: ' + v.mmsi : ''}</div>
+            </div>
+            <span class="badge ${located ? 'badge-live' : 'badge-wait'}">
+              ${located ? (v.sog ?? 0) + ' kn' : 'Listening'}
+            </span>
+          `;
+          div.onclick = () => {
+            if (located) {
+              map.flyTo([v.lat, v.lon], 8);
+              markers.get(v.imo)?.openPopup();
+            }
+          };
+          container.appendChild(div);
+        });
+    }
+
+    document.getElementById('refresh-btn').onclick = fetchFleet;
+    document.getElementById('search').oninput = renderList;
+
+    // 1-Hour Countdown & Auto-Refresh
+    setInterval(() => {
+      const auto = document.getElementById('auto-refresh').checked;
+      if (!auto) {
+        document.getElementById('countdown').textContent = 'Auto: Off';
+        return;
+      }
+      secondsRemaining--;
+      if (secondsRemaining <= 0) {
+        fetchFleet();
+      } else {
+        const mins = String(Math.floor(secondsRemaining / 60)).padStart(2, '0');
+        const secs = String(secondsRemaining % 60).padStart(2, '0');
+        document.getElementById('countdown').textContent = `Next: ${mins}:${secs}`;
+      }
+    }, 1000);
+
+    fetchFleet();
+  </script>
+</body>
+</html>
