@@ -31,7 +31,6 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_vessels_mmsi ON vessels(mmsi);
 `);
 
-// Seed the 49 Bahri tankers
 const FLEET_SEED = [
   { name: "AJWAD", imo: 9830795 }, { name: "AMAD", imo: 9783693 },
   { name: "AMJAD", imo: 9779800 }, { name: "AMZAN", imo: 9693745 },
@@ -68,15 +67,19 @@ const seedTx = db.transaction((vessels) => {
 });
 seedTx(FLEET_SEED);
 
-// Prepared statements for fast stream ingestion
-const imoSet = new Set(FLEET_SEED.map(v => v.imo));
-const knownMmsis = new Set(
-  db.prepare('SELECT mmsi FROM vessels WHERE mmsi IS NOT NULL').all().map(r => r.mmsi)
-);
+// Lookup maps for fast in-memory matching by IMO, MMSI, or normalized ShipName
+const imoToVessel = new Map(FLEET_SEED.map(v => [v.imo, v]));
+const nameToImo = new Map(FLEET_SEED.map(v => [v.name.toUpperCase(), v.imo]));
+const mmsiToImo = new Map();
+
+// Restore any previously discovered MMSIs from SQLite
+db.prepare('SELECT imo, mmsi FROM vessels WHERE mmsi IS NOT NULL').all().forEach(row => {
+  mmsiToImo.set(row.mmsi, row.imo);
+});
 
 const updateStaticStmt = db.prepare(`
   UPDATE vessels
-  SET mmsi = @mmsi,
+  SET mmsi = COALESCE(@mmsi, mmsi),
       destination = COALESCE(NULLIF(TRIM(@destination), ''), destination),
       draught = COALESCE(@draught, draught),
       lat = COALESCE(@lat, lat),
@@ -85,20 +88,32 @@ const updateStaticStmt = db.prepare(`
   WHERE imo = @imo
 `);
 
-const updatePositionStmt = db.prepare(`
+const updatePositionByImoStmt = db.prepare(`
   UPDATE vessels
-  SET lat = @lat,
+  SET mmsi = COALESCE(@mmsi, mmsi),
+      lat = @lat,
       lon = @lon,
       sog = @sog,
       cog = @cog,
       heading = @heading,
       nav_status = @nav_status,
       last_seen = @last_seen
-  WHERE mmsi = @mmsi
+  WHERE imo = @imo
 `);
+
+function normalizeVesselName(rawName) {
+  if (!rawName) return '';
+  // Trim padding/null bytes and strip common "BAHRI " prefix if transmitted
+  return rawName
+    .replace(/@+/g, '')
+    .trim()
+    .toUpperCase()
+    .replace(/^BAHRI\s+/, '');
+}
 
 // 2. AIS WebSocket Stream Client
 let wsStatus = 'disconnected';
+let packetsReceived = 0;
 let reconnectDelay = 2000;
 
 function connectAISStream() {
@@ -109,7 +124,6 @@ function connectAISStream() {
   }
 
   wsStatus = 'connecting';
-  // Enable permessage-deflate compression per aisstream.io guidelines
   const ws = new WebSocket(AIS_WS_URL, { perMessageDeflate: true });
 
   ws.on('open', () => {
@@ -117,17 +131,11 @@ function connectAISStream() {
     reconnectDelay = 2000;
     console.log(`[AIS] Connected to ${AIS_WS_URL}`);
 
-    // Subscribe globally to ShipStaticData (to map IMO -> MMSI) and PositionReport
     const subscription = {
       APIKey: AIS_API_KEY,
       BoundingBoxes: [[[-90, -180], [90, 180]]],
       FilterMessageTypes: ['PositionReport', 'ShipStaticData', 'StandardClassBPositionReport']
     };
-
-    // If all 49 MMSIs have been discovered, filter strictly by MMSI to reduce bandwidth
-    if (knownMmsis.size >= 49) {
-      subscription.FiltersShipMMSI = Array.from(knownMmsis);
-    }
 
     ws.send(JSON.stringify(subscription));
   });
@@ -135,39 +143,66 @@ function connectAISStream() {
   ws.on('message', (rawData) => {
     try {
       const packet = JSON.parse(rawData.toString('utf8'));
+
+      // Log explicit API key or subscription errors from the server
+      if (packet.error) {
+        console.error('[AIS] Stream Server Error:', packet.error);
+        wsStatus = `error: ${packet.error}`;
+        return;
+      }
+
+      packetsReceived++;
+      if (packetsReceived % 1000 === 0) {
+        console.log(`[AIS] Processed ${packetsReceived.toLocaleString()} packets | Matched vessels: ${mmsiToImo.size}/49`);
+      }
+
       const meta = packet.MetaData || {};
       const mmsi = meta.MMSI ? String(meta.MMSI).padStart(9, '0') : null;
+      const cleanName = normalizeVesselName(meta.ShipName);
       const now = meta.time_utc || new Date().toISOString();
 
-      // Match ShipStaticData by IMO to link IMO <-> MMSI
-      if (packet.MessageType === 'ShipStaticData' && packet.Message?.ShipStaticData) {
-        const staticData = packet.Message.ShipStaticData;
-        const imo = Number(staticData.ImoNumber);
+      // Resolve IMO via known MMSI, Static Data IMO, or MetaData.ShipName
+      let matchedImo = mmsi ? mmsiToImo.get(mmsi) : undefined;
 
-        if (imoSet.has(imo) && mmsi) {
-          const isNewMmsi = !knownMmsis.has(mmsi);
-          knownMmsis.add(mmsi);
-
-          updateStaticStmt.run({
-            imo,
-            mmsi,
-            destination: staticData.Destination || null,
-            draught: staticData.MaximumStaticDraught || null,
-            lat: meta.latitude ?? null,
-            lon: meta.longitude ?? null,
-            last_seen: now
-          });
-
-          if (isNewMmsi) {
-            console.log(`[AIS] Linked IMO ${imo} -> MMSI ${mmsi}`);
-          }
+      if (!matchedImo && packet.MessageType === 'ShipStaticData' && packet.Message?.ShipStaticData) {
+        const staticImo = Number(packet.Message.ShipStaticData.ImoNumber);
+        if (imoToVessel.has(staticImo)) {
+          matchedImo = staticImo;
         }
       }
 
-      // Match PositionReport for any discovered MMSI
-      if (mmsi && knownMmsis.has(mmsi) && packet.Message?.PositionReport) {
+      if (!matchedImo && cleanName && nameToImo.has(cleanName)) {
+        matchedImo = nameToImo.get(cleanName);
+      }
+
+      if (!matchedImo) return;
+
+      // Record MMSI mapping once resolved
+      if (mmsi && !mmsiToImo.has(mmsi)) {
+        mmsiToImo.set(mmsi, matchedImo);
+        const vessel = imoToVessel.get(matchedImo);
+        console.log(`[AIS] Matched ${vessel.name} (IMO ${matchedImo}) -> MMSI ${mmsi}`);
+      }
+
+      // Update Static Data
+      if (packet.MessageType === 'ShipStaticData' && packet.Message?.ShipStaticData) {
+        const staticData = packet.Message.ShipStaticData;
+        updateStaticStmt.run({
+          imo: matchedImo,
+          mmsi,
+          destination: staticData.Destination || null,
+          draught: staticData.MaximumStaticDraught || null,
+          lat: meta.latitude ?? null,
+          lon: meta.longitude ?? null,
+          last_seen: now
+        });
+      }
+
+      // Update Position Report
+      if (packet.Message?.PositionReport) {
         const pos = packet.Message.PositionReport;
-        updatePositionStmt.run({
+        updatePositionByImoStmt.run({
+          imo: matchedImo,
           mmsi,
           lat: pos.Latitude ?? meta.latitude,
           lon: pos.Longitude ?? meta.longitude,
@@ -179,7 +214,7 @@ function connectAISStream() {
         });
       }
     } catch (err) {
-      // Ignore malformed frames
+      // Ignore non-JSON frames
     }
   });
 
@@ -200,15 +235,20 @@ connectAISStream();
 // 3. REST API & Static Frontend
 app.use(express.static(path.join(__dirname, 'public')));
 
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 app.get('/api/fleet', (req, res) => {
   const vessels = db.prepare('SELECT * FROM vessels ORDER BY name ASC').all();
   const locatedCount = vessels.filter(v => v.lat !== null && v.lon !== null).length;
 
   res.json({
     stream_status: wsStatus,
+    packets_received: packetsReceived,
     total_vessels: vessels.length,
     located_count: locatedCount,
-    discovered_mmsis: knownMmsis.size,
+    discovered_mmsis: mmsiToImo.size,
     server_time: new Date().toISOString(),
     vessels
   });
