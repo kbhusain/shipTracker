@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bahri Fleet AIS Tracker (OpenStreetMap)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; height: 100vh; background: #0f172a; color: #f8fafc; }
+    #sidebar { width: 350px; background: #1e293b; border-right: 1px solid #334155; display: flex; flex-direction: column; }
+    .header { padding: 16px; border-bottom: 1px solid #334155; }
+    .header h1 { font-size: 1.1rem; margin-bottom: 6px; }
+    .status-bar { font-size: 0.8rem; color: #94a3b8; display: flex; justify-content: space-between; margin-bottom: 4px; }
+    .packet-bar { font-size: 0.75rem; color: #38bdf8; margin-bottom: 10px; }
+    .packet-bar.error { color: #f87171; font-weight: 600; }
+    .controls { display: flex; gap: 8px; align-items: center; }
+    button { background: #2563eb; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.85rem; }
+    button:hover { background: #1d4ed8; }
+    label.toggle { font-size: 0.8rem; color: #cbd5e1; display: flex; align-items: center; gap: 5px; cursor: pointer; }
+    #search { width: 100%; padding: 8px 12px; background: #0f172a; border: 1px solid #334155; color: #f8fafc; border-radius: 6px; margin-top: 10px; }
+    #vessel-list { flex: 1; overflow-y: auto; padding: 8px; }
+    .vessel-item { padding: 10px; border-radius: 6px; margin-bottom: 6px; background: #0f172a; border: 1px solid #334155; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+    .vessel-item:hover { border-color: #38bdf8; }
+    .vessel-name { font-weight: 600; font-size: 0.9rem; display: flex; align-items: center; gap: 6px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot-moving { background: #10b981; }
+    .dot-stopped { background: #f59e0b; }
+    .dot-wait { background: #475569; }
+    .vessel-meta { font-size: 0.75rem; color: #94a3b8; margin-top: 2px; }
+    .badge { font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+    .badge-live { background: #065f46; color: #6ee7b7; }
+    .badge-stopped { background: #78350f; color: #fcd34d; }
+    .badge-wait { background: #334155; color: #94a3b8; }
+    #map { flex: 1; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <div class="header">
+      <h1>Bahri Fleet AIS Tracker</h1>
+      <div class="status-bar">
+        <span id="stats">Loading fleet...</span>
+        <span id="countdown">Next: 60:00</span>
+      </div>
+      <div id="stream-info" class="packet-bar">Connecting to AIS stream...</div>
+      <div class="controls">
+        <button id="refresh-btn">Refresh Now</button>
+        <label class="toggle">
+          <input type="checkbox" id="auto-refresh" checked />
+          Auto-refresh (1h)
+        </label>
+      </div>
+      <input type="text" id="search" placeholder="Filter by vessel name or IMO..." />
+    </div>
+    <div id="vessel-list"></div>
+  </div>
+  <div id="map"></div>
+
+  <script>
+    const map = L.map('map').setView([24.0, 45.0], 3);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const markers = new Map();
+    let fleetData = [];
+    let secondsRemaining = 3600;
+
+    function getCircleStyle(sog) {
+      const isMoving = sog !== null && sog > 0.5;
+      return {
+        radius: 8,
+        fillColor: isMoving ? '#10b981' : '#f59e0b',
+        color: '#ffffff',
+        weight: 2,
+        opacity: 1,
+        fillOpacity: 0.9
+      };
+    }
+
+    async function fetchFleet() {
+      const res = await fetch('/api/fleet');
+      const data = await res.json();
+      fleetData = data.vessels;
+
+      document.getElementById('stats').textContent =
+        `Plotted: ${data.located_count}/${data.total_vessels}`;
+
+      const streamEl = document.getElementById('stream-info');
+      const isErr = data.stream_status.startsWith('error') || data.stream_status.startsWith('missing');
+      streamEl.className = isErr ? 'packet-bar error' : 'packet-bar';
+      streamEl.textContent = `Stream: ${data.stream_status} | Packets: ${(data.packets_received ?? 0).toLocaleString()}`;
+
+      updateMarkers();
+      renderList();
+      secondsRemaining = 3600;
+    }
+
+    function updateMarkers() {
+      fleetData.forEach(v => {
+        if (v.lat !== null && v.lon !== null) {
+          const popupHtml = `
+            <strong>${v.name}</strong> (IMO: ${v.imo})<br/>
+            MMSI: ${v.mmsi || 'Pending'}<br/>
+            Speed: ${v.sog !== null ? v.sog + ' kn' : 'N/A'} | Course: ${v.cog !== null ? v.cog + '°' : 'N/A'}<br/>
+            Destination: ${v.destination || 'Unknown'}<br/>
+            Last AIS: ${v.last_seen ? new Date(v.last_seen).toLocaleString() : 'N/A'}
+          `;
+
+          if (markers.has(v.imo)) {
+            const circle = markers.get(v.imo);
+            circle.setLatLng([v.lat, v.lon]);
+            circle.setStyle(getCircleStyle(v.sog));
+            circle.setPopupContent(popupHtml);
+          } else {
+            const circle = L.circleMarker([v.lat, v.lon], getCircleStyle(v.sog))
+              .bindTooltip(v.name, { direction: 'top', offset: [0, -6] })
+              .bindPopup(popupHtml)
+              .addTo(map);
+            markers.set(v.imo, circle);
+          }
+        }
+      });
+    }
+
+    function renderList() {
+      const q = document.getElementById('search').value.toLowerCase();
+      const container = document.getElementById('vessel-list');
+      container.innerHTML = '';
+
+      fleetData
+        .filter(v => v.name.toLowerCase().includes(q) || String(v.imo).includes(q))
+        .forEach(v => {
+          const located = v.lat !== null && v.lon !== null;
+          const isMoving = located && v.sog !== null && v.sog > 0.5;
+          const dotClass = !located ? 'dot-wait' : (isMoving ? 'dot-moving' : 'dot-stopped');
+          const badgeClass = !located ? 'badge-wait' : (isMoving ? 'badge-live' : 'badge-stopped');
+
+          const div = document.createElement('div');
+          div.className = 'vessel-item';
+          div.innerHTML = `
+            <div>
+              <div class="vessel-name"><span class="dot ${dotClass}"></span>${v.name}</div>
+              <div class="vessel-meta">IMO: ${v.imo} ${v.mmsi ? '• MMSI: ' + v.mmsi : ''}</div>
+            </div>
+            <span class="badge ${badgeClass}">
+              ${located ? (v.sog ?? 0) + ' kn' : 'Listening'}
+            </span>
+          `;
+          div.onclick = () => {
+            if (located) {
+              map.flyTo([v.lat, v.lon], 8);
+              markers.get(v.imo)?.openPopup();
+            }
+          };
+          container.appendChild(div);
+        });
+    }
+
+    document.getElementById('refresh-btn').onclick = fetchFleet;
+    document.getElementById('search').oninput = renderList;
+
+    setInterval(() => {
+      const auto = document.getElementById('auto-refresh').checked;
+      if (!auto) {
+        document.getElementById('countdown').textContent = 'Auto: Off';
+        return;
+      }
+      secondsRemaining--;
+      if (secondsRemaining <= 0) {
+        fetchFleet();
+      } else {
+        const mins = String(Math.floor(secondsRemaining / 60)).padStart(2, '0');
+        const secs = String(secondsRemaining % 60).padStart(2, '0');
+        document.getElementById('countdown').textContent = `Next: ${mins}:${secs}`;
+      }
+    }, 1000);
+
+    fetchFleet();
+  </script>
+</body>
+</html>
